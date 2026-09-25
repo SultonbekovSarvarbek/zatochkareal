@@ -4,188 +4,75 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a production-ready Telegram bot for a knife sharpening service ("Zatochka") in Uzbekistan. The bot handles customer order intake with bilingual support (Russian and Uzbekik), photo management, location tracking, and admin order management. The bot uses SQLite for data persistence and includes comprehensive error handling, rate limiting, and security features.
+Telegram bot (Telegraf 4 + better-sqlite3) for a knife sharpening service ("Zatochka") in Uzbekistan. Customers place orders in a private chat in Russian or Uzbek; orders are stored in SQLite and posted to an admin group.
 
-## Running the Bot
+## Commands
 
 ```bash
-# Install dependencies
 npm install
-
-# Start the bot
-node bot.js
+npm start          # node bot.js
+npm test           # node --test test/*.test.js
 ```
+
+Node.js 20+ (required by better-sqlite3 12).
 
 ## Environment Variables
 
-Required in `.env`:
-- `BOT_TOKEN` - Telegram bot token from @BotFather
-- `GROUP_CHAT_ID` - Telegram group chat ID where admin notifications are sent
-- `ADMIN_USER_IDS` (Optional) - Comma-separated list of Telegram user IDs who can use admin commands. If not specified, all group members can use admin commands.
+- `BOT_TOKEN` (required) - token from @BotFather
+- `GROUP_CHAT_ID` (required) - admin group chat id
+- `ADMIN_USER_IDS` (optional) - comma-separated user ids allowed to use admin commands/buttons. If empty, every member of the admin group is an admin.
+- `DB_PATH` (optional, default `orders.db`)
+- `DEBUG_SQL=1` (optional) - logs every SQL statement **with bound values (personal data)**; debugging only.
 
-See `.env.example` for a template.
+## Files
+
+- `bot.js` - handlers, messages, keyboards. Exports `{ bot, db }`; launches only when run directly (`require.main === module`), so tests can require it.
+- `database.js` - `BotDatabase` class, schema and all SQL.
+- `validation.js` - pure input validation (phone, name, location, knives count).
+- `test/` - `node:test` suites. `bot.test.js` stubs `Telegram.prototype.callApi` and drives the bot via `bot.handleUpdate`.
 
 ## Architecture
 
-### Database (SQLite)
-The bot uses SQLite via `better-sqlite3` for persistent storage. The database is managed through the `BotDatabase` class in `database.js`:
+### Handler order in bot.js (matters)
+1. Admin handlers (`/find`, `/orders`, `orders_page:*`, `order_ready:*`) guarded by `requireAdmin` (must be the admin group AND whitelisted user).
+2. Private-chat gate: everything below only runs in private chats. Messages in the admin group or other chats are ignored.
+3. Rate limit middleware (30 updates/min per user, warns once per window).
+4. Message type filter, then customer handlers.
 
-**Tables:**
-- `sessions` - Active user sessions with auto-expiration (30 minutes)
-- `orders` - Active orders awaiting completion
-- `completed_orders` - Archive of completed and cancelled orders (90-day history)
-- `rate_limits` - Rate limiting counters per user
+### Concurrency
+Telegraf polling handles a batch of updates concurrently (`Promise.all`), and photo albums arrive as separate updates. Rules:
+- Never read a session, `await`, then save that same object - concurrent handlers' changes get overwritten. Do read-modify-write synchronously (better-sqlite3 is sync) or in a `db.transaction`.
+- Photos are appended with `db.addSessionPhoto` (transaction, enforces `MAX_PHOTOS_PER_ORDER = 10`). Album status replies are debounced per `media_group_id`.
+- Placing an order uses `db.placeOrderFromSession` (creates the order and deletes the session in one transaction) before any `await`, so a double tap cannot create two orders.
 
-**Key Features:**
-- WAL mode for better concurrency
-- Indexed searches for performance (O(1) lookups by shortId)
-- Transaction support for data integrity
-- Automatic cleanup of expired sessions (every 5 minutes)
+### Database tables
+- `sessions` - in-progress drafts, expire after 30 min of inactivity (cleanup every 5 min)
+- `orders` - active orders
+- `completed_orders` - archive of completed/cancelled orders (kept indefinitely)
+- `rate_limits` - per-user counters (old rows cleaned every 5 min)
+- `counters` - sequence for short order ids
 
-### Session Management
-Sessions are stored in the SQLite database and automatically expire after 30 minutes of inactivity. Each session tracks:
-- `step` - Current step in the order flow (lang, name, phone, location, knives, photo)
-- `lang` - User's selected language (ru/uz)
-- `name`, `phone`, `location`, `knives` - Order details
-- `photos` - Array of Telegram file_ids for uploaded photos (stored as JSON)
-- `lastPhotoMessageId` - Message ID for updating photo management UI
+### Order ids
+- Full id: `${userId}_${timestamp}_${shortId}` (used in callback data; keep callback data under 64 bytes)
+- Short id: sequential number zero-padded to 6 digits (`000123`), unique among active orders. `/find 123` pads the input.
+- Older orders may have legacy ids `${userId}_${timestamp}` with timestamp-based short ids; both formats work.
 
-### Order Management
-Orders are persisted in SQLite with both full and short IDs:
-- Full ID: `${userId}_${timestamp}` for internal use
-- Short ID: Last 6 digits of timestamp for admin convenience
+### Flow
+`lang` → `name` (2-100 chars) → `phone` (normalized to `+998XXXXXXXXX`; text or contact button) → `location` (location button only; text re-asks) → `knives` (whole number 1-50) → `photo` (1-10 photos, management UI).
 
-Orders are **archived** (not deleted) when completed or cancelled, providing an audit trail.
-
-### Security Features
-1. **Environment Validation** - Bot validates all required environment variables on startup and exits with clear error messages if missing
-2. **Rate Limiting** - 10 messages per minute per user to prevent DoS attacks
-3. **Admin Authorization** - Optional whitelist of admin user IDs for sensitive commands
-4. **Input Sanitization** - All user inputs are sanitized to prevent injection attacks
-5. **Graceful Shutdown** - Proper cleanup on SIGINT/SIGTERM signals
-
-### Multi-step Flow
-1. Language selection (ru/uz)
-2. Name input (validated: min 2 chars, max 100 chars)
-3. Phone number (validated: +998XXXXXXXXX format, text or contact button)
-4. Location (validated: proper coordinates, location button)
-5. Number of knives (validated: 1-50)
-6. Photo upload with management UI
-
-### Photo Handling
-Photos are saved immediately to the database to prevent race conditions. Users can:
-- Add multiple photos
-- View all uploaded photos (sent as media groups up to 10 at a time)
-- Delete individual photos
-- Delete all photos
-- Submit order when ready
-
-The bot sends all photos to the admin group with captions containing order details and a short 6-digit ID for easy reference.
-
-### Admin Features
-Available only in the GROUP_CHAT_ID group chat, with optional user ID whitelist:
-- `/find [6-digit-id]` - Search for an active order by its short ID (O(1) database lookup)
-- `/orders` - List all active orders with pagination (10 orders per page)
-- "Заказ готов" button - Mark an order as complete and archive it
-
-### Callbacks and Actions
-The bot uses Telegraf callback actions for interactive buttons:
-- `photos_*` - Photo management actions (done, add, delete, view, delete_all)
-- `delete_photo:[index]` - Delete specific photo by index
-- `cancel_order:[orderId]` - User cancels their own order (archived as cancelled)
-- `order_ready:[orderId]` - Admin marks order as complete (archived as completed)
-- `orders_page:[pageNum]` - Pagination for orders list
-- `restart` - User starts a new order (cancels active order if exists)
+### Messages and formatting
+- No `parse_mode` is used anywhere, so user text is sent as-is. Do not HTML-escape it; if you ever add `parse_mode: 'HTML'`, escape at output time only.
+- Customer texts live in `messages.ru` / `messages.uz`; add keys to both. Admin group texts are always Russian (`formatOrderForAdmin`).
 
 ### Notifications
-- Users receive order confirmations with summary and action buttons
-- Admins receive orders in the group chat with photos and order details
-- Cancellations notify the admin group
-- All Telegram API errors are logged with context
-
-## Key Implementation Details
-
-### Constants
-All magic numbers are extracted to constants at the top of bot.js:
-- `MAX_KNIVES = 50`
-- `MIN_KNIVES = 1`
-- `SESSION_TIMEOUT_MS = 30 * 60 * 1000` (30 minutes)
-- `CLEANUP_INTERVAL_MS = 5 * 60 * 1000` (5 minutes)
-- `RATE_LIMIT_MAX_MESSAGES = 10`
-- `RATE_LIMIT_WINDOW_MS = 60 * 1000` (1 minute)
-- `MEDIA_GROUP_MAX_SIZE = 10`
-
-### Validation Helpers
-Dedicated validation functions ensure data integrity:
-- `isValidUzbekPhone(phone)` - Validates +998XXXXXXXXX format
-- `normalizeUzbekPhone(phone)` - Normalizes phone to +998XXXXXXXXX
-- `isValidName(name)` - Validates name (2-100 chars)
-- `isValidLocation(location)` - Validates GPS coordinates
-- `isValidKnivesCount(count)` - Validates knives count (1-50)
-
-### Sanitization
-All user inputs are sanitized to prevent injection attacks:
-- `sanitizeText(text)` - Escapes HTML special characters
-- `sanitizeLocation(location)` - Validates and clamps GPS coordinates
-
-### Order IDs
-- Full ID: `${userId}_${timestamp}` (stored internally)
-- Short ID: Last 6 digits of timestamp (shown to admins for easy reference)
-
-### Timestamps
-Uses 'Asia/Tashkent' timezone for all date/time displays
+- Admin group gets: photos as albums, then the order card with the "✅ Заказ готов" button; user cancellations (by button or by "restart" under the summary).
+- Abandoned drafts (`/start`, `/cancel`, restart text) do not notify admins: they never saw them.
+- The customer is not notified when an order is marked ready.
 
 ### Logging
-Structured logging with log levels (INFO, WARN, ERROR) and timestamps:
-- All errors include stack traces and context
-- All admin actions are logged for audit
-- Rate limit violations are logged
+Log ids only (userId, orderId, shortId). Never log names, phones or coordinates.
 
-## Common Development Patterns
-
-When adding new features:
-1. Update the `messages` object for both `ru` and `uz` languages
-2. Add validation helpers for new inputs
-3. Add database schema changes if storing new data
-4. Use callback actions for interactive buttons with the pattern `action_name:data`
-5. Always check session validity in callbacks before proceeding
-6. Wrap all ctx.reply/ctx.telegram calls in try-catch
-7. Use `ctx.answerCbQuery()` to acknowledge callback queries
-8. Log important actions with appropriate log level
-9. Test with both languages
-
-When modifying order flow:
-1. Consider the session step progression
-2. Update both text handlers and callback handlers as needed
-3. Update database.js if changing data structure
-4. Test notification messages to both user and admin group
-5. Ensure order archival properly preserves data
-
-When modifying database:
-1. Update the schema in database.js `initSchema()`
-2. Add appropriate indexes for performance
-3. Update conversion methods (_orderRowToObject, etc.)
-4. Test migration from old data if applicable
-
-## Bot Commands
-
-User commands:
-- `/start` - Start new order (cancels previous session if exists)
-- `/cancel` - Cancel current order
-
-Admin commands (GROUP_CHAT_ID only, with optional ADMIN_USER_IDS whitelist):
-- `/find [6-digit-id]` - Search for active order
-- `/orders` - List all active orders with pagination
-
-## Database File
-
-The SQLite database is stored in `orders.db` in the project root. This file contains all active orders, sessions, and historical data. To backup data, simply copy this file. To reset the database, delete this file (bot will recreate schema on next start).
-
-## Error Handling
-
-All errors are caught and logged with context. The bot will:
-- Never crash on user input errors
-- Log all Telegram API errors
-- Handle database errors gracefully
-- Show friendly error messages to users
-- Exit cleanly on SIGINT/SIGTERM
+## Conventions
+- Wrap handler bodies in try/catch; use `safeAnswerCbQuery` for callback queries.
+- Use `withRetry` for messages to the admin group (handles Telegram 429 `retry_after`).
+- Add a test in `test/` for any bug fix.

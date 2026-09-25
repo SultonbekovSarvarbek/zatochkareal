@@ -3,3 +3,6 @@ node_modules/
 orders.db
 orders.db-shm
 orders.db-wal
+.idea/
+.vscode/
+.DS_Store

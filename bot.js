@@ -1,16 +1,26 @@
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const BotDatabase = require('./database');
+const {
+    MAX_KNIVES,
+    MIN_KNIVES,
+    normalizeUzbekPhone,
+    isValidName,
+    parseKnivesCount,
+    sanitizeLocation,
+} = require('./validation');
 
 // ========== CONSTANTS ==========
-const MAX_KNIVES = 50;
-const MIN_KNIVES = 1;
 const SHORT_ID_LENGTH = 6;
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const RATE_LIMIT_MAX_MESSAGES = 10;
+const RATE_LIMIT_MAX_MESSAGES = 30; // high enough for a 10-photo album plus button taps
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
 const MEDIA_GROUP_MAX_SIZE = 10;
+const MAX_PHOTOS_PER_ORDER = 10;
+const ALBUM_DEBOUNCE_MS = 1500; // wait for the rest of an album before replying once
+const ORDERS_PAGE_SIZE = 10;
+const TELEGRAM_RETRY_ATTEMPTS = 3;
 
 // ========== ENVIRONMENT VALIDATION ==========
 function validateEnvironment() {
@@ -23,28 +33,31 @@ function validateEnvironment() {
         process.exit(1);
     }
 
-    // Validate GROUP_CHAT_ID is a number
-    if (isNaN(parseInt(process.env.GROUP_CHAT_ID))) {
+    const groupChatId = process.env.GROUP_CHAT_ID.trim();
+    if (!/^-?\d+$/.test(groupChatId)) {
         console.error('❌ FATAL: GROUP_CHAT_ID must be a valid number');
         process.exit(1);
     }
 
-    // Parse admin IDs if provided
-    const adminIds = process.env.ADMIN_USER_IDS ?
-        process.env.ADMIN_USER_IDS.split(',').map(id => parseInt(id.trim())) : [];
+    const adminIds = (process.env.ADMIN_USER_IDS || '')
+        .split(',')
+        .map(id => id.trim())
+        .filter(id => /^\d+$/.test(id))
+        .map(Number);
 
     return {
         botToken: process.env.BOT_TOKEN,
-        groupChatId: process.env.GROUP_CHAT_ID,
-        adminIds: adminIds
+        groupChatId,
+        adminIds
     };
 }
 
 const config = validateEnvironment();
 const bot = new Telegraf(config.botToken);
-const db = new BotDatabase();
+const db = new BotDatabase(process.env.DB_PATH || 'orders.db');
 
 // ========== LOGGING ==========
+// Never log names, phones or coordinates: only ids.
 const logger = {
     info: (message, context = {}) => {
         console.log(`[INFO] [${new Date().toISOString()}] ${message}`, context);
@@ -60,96 +73,73 @@ const logger = {
     }
 };
 
-// ========== VALIDATION HELPERS ==========
-function isValidUzbekPhone(phone) {
-    const cleaned = phone.replace(/\s+/g, '');
-    return /^(\+998|998)\d{9}$/.test(cleaned);
-}
+// ========== TELEGRAM HELPERS ==========
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-function normalizeUzbekPhone(phone) {
-    const cleaned = phone.replace(/\s+/g, '').replace(/[^\d+]/g, '');
-    if (cleaned.startsWith('998') && !cleaned.startsWith('+')) {
-        return '+' + cleaned;
-    }
-    return cleaned;
-}
-
-function isValidName(name) {
-    return name && name.trim().length >= 2 && name.trim().length <= 100;
-}
-
-function isValidLocation(location) {
-    return location &&
-        typeof location.latitude === 'number' &&
-        typeof location.longitude === 'number' &&
-        location.latitude >= -90 && location.latitude <= 90 &&
-        location.longitude >= -180 && location.longitude <= 180;
-}
-
-function isValidKnivesCount(count) {
-    const num = parseInt(count);
-    return !isNaN(num) && num >= MIN_KNIVES && num <= MAX_KNIVES;
-}
-
-// ========== SANITIZATION ==========
-function sanitizeText(text) {
-    if (!text) return '';
-    // Escape special characters that could break Telegram formatting
-    return text.replace(/[<>&]/g, char => {
-        switch (char) {
-            case '<': return '&lt;';
-            case '>': return '&gt;';
-            case '&': return '&amp;';
-            default: return char;
+// Retries a Telegram call when it is rate limited (HTTP 429 with retry_after)
+async function withRetry(fn) {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            const retryAfter = error?.response?.parameters?.retry_after;
+            if (!retryAfter || attempt >= TELEGRAM_RETRY_ATTEMPTS) throw error;
+            logger.warn('Telegram rate limit, retrying', { retryAfter, attempt });
+            await sleep((retryAfter + 1) * 1000);
         }
-    });
+    }
 }
 
-function sanitizeLocation(location) {
-    if (!location || !isValidLocation(location)) {
-        return null;
+async function safeAnswerCbQuery(ctx, text) {
+    try {
+        await ctx.answerCbQuery(text);
+    } catch (e) {
+        // Query too old or already answered
     }
-    // Ensure coordinates are valid numbers
-    return {
-        latitude: Math.max(-90, Math.min(90, parseFloat(location.latitude))),
-        longitude: Math.max(-180, Math.min(180, parseFloat(location.longitude)))
-    };
+}
+
+function isGroupChat(ctx) {
+    return String(ctx.chat?.id) === config.groupChatId;
 }
 
 // ========== AUTHORIZATION ==========
 function isAdmin(userId) {
-    return config.adminIds.length === 0 || config.adminIds.includes(parseInt(userId));
+    return config.adminIds.length === 0 || config.adminIds.includes(Number(userId));
 }
 
-function requireAdmin(ctx, next) {
-    const chatId = ctx.chat.id;
-    const userId = ctx.from.id;
+async function requireAdmin(ctx, next) {
+    const userId = ctx.from?.id;
 
     // Must be in admin group
-    if (String(chatId) !== String(config.groupChatId)) {
-        logger.warn('Admin command attempted outside group', { userId, chatId });
+    if (!isGroupChat(ctx)) {
+        logger.warn('Admin action attempted outside group', { userId, chatId: ctx.chat?.id });
+        if (ctx.callbackQuery) await safeAnswerCbQuery(ctx);
         return;
     }
 
     // Must be authorized admin (if whitelist configured)
     if (!isAdmin(userId)) {
-        logger.warn('Unauthorized admin command attempt', { userId });
-        return ctx.reply('❌ У вас нет прав для выполнения этой команды.');
+        logger.warn('Unauthorized admin action attempt', { userId });
+        const text = '❌ У вас нет прав для выполнения этой команды.';
+        return ctx.callbackQuery ? safeAnswerCbQuery(ctx, text) : ctx.reply(text);
     }
 
     return next();
 }
 
 // ========== MESSAGES ==========
+const mapsLink = (location) => `https://www.google.com/maps?q=${location.latitude},${location.longitude}`;
+
 const messages = {
     ru: {
         welcome: 'Здравствуйте! Пожалуйста, выберите язык:',
         ask_name: 'Введите ваше имя:',
         ask_phone: 'Введите номер телефона (в формате +998XXXXXXXXX):',
-        ask_location: 'Отправьте вашу локацию:',
+        ask_location: 'Отправьте вашу локацию кнопкой ниже:',
         ask_knives: `Сколько ножей вы хотите заточить? (${MIN_KNIVES}–${MAX_KNIVES})`,
-        ask_photo: 'Отправьте одно или несколько фото ваших ножей:',
-        photo_received: (count) => `📷 Фото получено (${count})`,
+        ask_photo: `Отправьте одно или несколько фото ваших ножей (до ${MAX_PHOTOS_PER_ORDER}):`,
+        photo_received: (count) => `📷 Фото получено (${count}/${MAX_PHOTOS_PER_ORDER})`,
+        photo_limit: `⚠️ Можно отправить не больше ${MAX_PHOTOS_PER_ORDER} фото. Лишние фото не добавлены.`,
         photo_options: 'Выберите действие:',
         photos_done: 'Готово - Отправить заказ',
         photos_add: 'Добавить ещё фото',
@@ -158,32 +148,45 @@ const messages = {
         photos_delete_all: 'Удалить все фото',
         select_photo_delete: 'Выберите фото для удаления:',
         photo_deleted: 'Фото удалено',
-        no_photos: 'Нет фотографий для удаления',
+        no_photos: 'Нет фотографий',
         confirm_delete_all: 'Вы уверены, что хотите удалить все фото?',
         delete_all_yes: 'Да, удалить все',
         delete_all_no: 'Нет, оставить',
         all_photos_deleted: 'Все фото удалены',
-        summary: (data) => `✅ Заявка принята! Наш оператор вам перезвонит озвучить цену.\n\n👤 Имя: ${sanitizeText(data.name)}\n📞 Телефон: ${data.phone}\n📍 Локация: https://www.google.com/maps?q=${data.location.latitude},${data.location.longitude}\n🔪 Кол-во ножей: ${data.knives}${data.photos && data.photos.length > 0 ? `\n📷 Фото: ${data.photos.length}` : ''}`,
+        summary: (data) => `✅ Заявка принята! Наш оператор вам перезвонит озвучить цену.\n\n👤 Имя: ${data.name}\n📞 Телефон: ${data.phone}\n📍 Локация: ${mapsLink(data.location)}\n🔪 Кол-во ножей: ${data.knives}${data.photos && data.photos.length > 0 ? `\n📷 Фото: ${data.photos.length}` : ''}`,
         cancel: 'Заявка отменена. Чтобы начать заново, отправьте /start',
         location_button: 'Отправить локацию',
+        phone_button: '📞 Отправить мой номер',
         restart: '🔄 Начать заново',
+        cancel_order: 'Отменить заказ',
+        order_cancelled: 'Заказ отменён.',
         invalid_phone: '❌ Неверный номер телефона. Введите номер в формате +998XXXXXXXXX',
-        invalid_knives: `❌ Введите количество ножей (число от ${MIN_KNIVES} до ${MAX_KNIVES})`,
-        invalid_name: '❌ Введите корректное имя (минимум 2 символа)',
-        only_text: '❌ Ошибка.',
+        invalid_knives: `❌ Введите количество ножей (целое число от ${MIN_KNIVES} до ${MAX_KNIVES})`,
+        invalid_name: '❌ Введите корректное имя (от 2 до 100 символов)',
+        invalid_location: '❌ Некорректная локация. Попробуйте снова.',
+        only_text: '❌ Пожалуйста, отправьте текст, контакт, локацию или фото.',
         session_expired: '⏰ Ваша сессия истекла. Пожалуйста, начните заново с /start',
         rate_limited: '⚠️ Слишком много сообщений. Пожалуйста, подождите минуту.',
         order_sent: (count) => `✅ Заказ успешно отправлен с ${count} фото!`,
         at_least_one_photo: 'Необходимо добавить хотя бы одно фото',
+        add_more_photos: '📸 Отправьте ещё одно фото или несколько фото',
+        photos_shown: (count) => `📷 Показываю все ваши фото (${count}):`,
+        photos_shown_done: '📷 Все фото показаны. Выберите действие:',
+        all_deleted_hint: (count) => `🗑️ Все фото удалены (${count}). Добавьте хотя бы одно фото для продолжения`,
+        delete_cancelled: (count) => `❌ Удаление отменено. У вас ${count} фото`,
+        photo_label: (n) => `Фото ${n}`,
+        back: '⬅️ Назад',
+        error: '❌ Произошла ошибка. Попробуйте позже или используйте /cancel для сброса.',
     },
     uz: {
         welcome: 'Salom! Iltimos, tilni tanlang:',
         ask_name: 'Ismingizni kiriting:',
         ask_phone: 'Telefon raqamingizni kiriting (+998XXXXXXXXX formatida):',
-        ask_location: 'Iltimos, joylashuvingizni yuboring:',
+        ask_location: 'Iltimos, quyidagi tugma orqali joylashuvingizni yuboring:',
         ask_knives: `Nechta pichoqni charxlatmoqchisiz? (${MIN_KNIVES}–${MAX_KNIVES})`,
-        ask_photo: 'Pichoqlaringizning bir yoki bir nechta fotosuratini yuboring:',
-        photo_received: (count) => `📷 Foto qabul qilindi (${count})`,
+        ask_photo: `Pichoqlaringizning bir yoki bir nechta fotosuratini yuboring (${MAX_PHOTOS_PER_ORDER} tagacha):`,
+        photo_received: (count) => `📷 Foto qabul qilindi (${count}/${MAX_PHOTOS_PER_ORDER})`,
+        photo_limit: `⚠️ ${MAX_PHOTOS_PER_ORDER} tadan ortiq foto yuborib bo'lmaydi. Ortiqcha fotolar qo'shilmadi.`,
         photo_options: 'Amalni tanlang:',
         photos_done: 'Tayyor - Buyurtmani yuborish',
         photos_add: 'Yana foto qo\'shish',
@@ -192,188 +195,201 @@ const messages = {
         photos_delete_all: 'Barcha fotolarni o\'chirish',
         select_photo_delete: 'O\'chirish uchun fotoni tanlang:',
         photo_deleted: 'Foto o\'chirildi',
-        no_photos: 'O\'chirish uchun fotolar yo\'q',
+        no_photos: 'Fotolar yo\'q',
         confirm_delete_all: 'Barcha fotolarni o\'chirishni xohlaysizmi?',
         delete_all_yes: 'Ha, barchasini o\'chirish',
         delete_all_no: 'Yo\'q, qoldirish',
         all_photos_deleted: 'Barcha fotolar o\'chirildi',
-        summary: (data) => `✅ Buyurtma qabul qilindi! Bizning operator sizga qo\'ng\'iroq qilib narxni aytadi.\n\n👤 Ism: ${sanitizeText(data.name)}\n📞 Telefon: ${data.phone}\n📍 Joylashuv: https://www.google.com/maps?q=${data.location.latitude},${data.location.longitude}\n🔪 Pichoqlar soni: ${data.knives}${data.photos && data.photos.length > 0 ? `\n📷 Foto: ${data.photos.length}` : ''}`,
+        summary: (data) => `✅ Buyurtma qabul qilindi! Bizning operator sizga qo'ng'iroq qilib narxni aytadi.\n\n👤 Ism: ${data.name}\n📞 Telefon: ${data.phone}\n📍 Joylashuv: ${mapsLink(data.location)}\n🔪 Pichoqlar soni: ${data.knives}${data.photos && data.photos.length > 0 ? `\n📷 Foto: ${data.photos.length}` : ''}`,
         cancel: 'Buyurtma bekor qilindi. Qayta boshlash uchun /start ni yuboring',
         location_button: 'Joylashuvni yuborish',
+        phone_button: '📞 Raqamni yuborish',
         restart: '🔄 Qayta boshlash',
+        cancel_order: 'Buyurtmani bekor qilish',
+        order_cancelled: 'Buyurtma bekor qilindi.',
         invalid_phone: '❌ Telefon raqami noto\'g\'ri. +998XXXXXXXXX formatida kiriting.',
-        invalid_knives: `❌ Pichoqlar soni noto\'g\'ri (${MIN_KNIVES} dan ${MAX_KNIVES} gacha).`,
-        invalid_name: '❌ To\'g\'ri ismni kiriting (kamida 2 ta belgi)',
-        only_text: '❌ Iltimos, faqat matn yoki joylashuv yuboring.',
+        invalid_knives: `❌ Pichoqlar soni noto'g'ri (${MIN_KNIVES} dan ${MAX_KNIVES} gacha butun son).`,
+        invalid_name: '❌ To\'g\'ri ismni kiriting (2 dan 100 gacha belgi)',
+        invalid_location: '❌ Noto\'g\'ri joylashuv. Qayta urinib ko\'ring.',
+        only_text: '❌ Iltimos, matn, kontakt, joylashuv yoki foto yuboring.',
         session_expired: '⏰ Sessiyangiz tugadi. Iltimos, /start bilan qayta boshlang',
         rate_limited: '⚠️ Juda ko\'p xabarlar. Iltimos, bir daqiqa kuting.',
         order_sent: (count) => `✅ Buyurtma ${count} ta foto bilan muvaffaqiyatli yuborildi!`,
         at_least_one_photo: 'Kamida bitta foto qo\'shish kerak',
+        add_more_photos: '📸 Yana bir yoki bir nechta foto yuboring',
+        photos_shown: (count) => `📷 Barcha fotolaringizni ko'rsatyapman (${count}):`,
+        photos_shown_done: '📷 Barcha fotolar ko\'rsatildi. Amalni tanlang:',
+        all_deleted_hint: (count) => `🗑️ Barcha fotolar o'chirildi (${count}). Davom etish uchun kamida bitta foto qo'shing`,
+        delete_cancelled: (count) => `❌ O'chirish bekor qilindi. Sizda ${count} ta foto bor`,
+        photo_label: (n) => `Foto ${n}`,
+        back: '⬅️ Orqaga',
+        error: '❌ Xatolik yuz berdi. Keyinroq urinib ko\'ring yoki /cancel dan foydalaning.',
     }
 };
 
-// ========== KEYBOARD BUILDER ==========
+const LANGUAGE_BUTTONS = { 'Русский 🇷🇺': 'ru', "O'zbek 🇺🇿": 'uz' };
+
+function t(lang) {
+    return messages[lang] || messages.ru;
+}
+
+// ========== KEYBOARD BUILDERS ==========
+function languageKeyboard() {
+    return Markup.keyboard([Object.keys(LANGUAGE_BUTTONS)]).oneTime().resize();
+}
+
+function locationKeyboard(lang) {
+    return Markup.keyboard([
+        [Markup.button.locationRequest(t(lang).location_button)]
+    ]).oneTime().resize();
+}
+
+function phoneKeyboard(lang) {
+    return Markup.keyboard([
+        [Markup.button.contactRequest(t(lang).phone_button)]
+    ]).oneTime().resize();
+}
+
 function buildPhotoManagementKeyboard(lang, hasPhotos = true) {
+    const m = t(lang);
     if (!hasPhotos) {
         return Markup.inlineKeyboard([
-            [Markup.button.callback(messages[lang].photos_add, 'photos_add')]
+            [Markup.button.callback(m.photos_add, 'photos_add')]
         ]);
     }
 
     return Markup.inlineKeyboard([
-        [Markup.button.callback(messages[lang].photos_done, 'photos_done')],
+        [Markup.button.callback(m.photos_done, 'photos_done')],
         [
-            Markup.button.callback(messages[lang].photos_add, 'photos_add'),
-            Markup.button.callback(messages[lang].photos_view, 'photos_view')
+            Markup.button.callback(m.photos_add, 'photos_add'),
+            Markup.button.callback(m.photos_view, 'photos_view')
         ],
         [
-            Markup.button.callback(messages[lang].photos_delete, 'photos_delete'),
-            Markup.button.callback(messages[lang].photos_delete_all, 'photos_delete_all')
+            Markup.button.callback(m.photos_delete, 'photos_delete'),
+            Markup.button.callback(m.photos_delete_all, 'photos_delete_all')
         ]
     ]);
 }
 
-// ========== HELPER FUNCTIONS ==========
-async function notifyCancellation(session) {
-    if (!session || !session.name || !session.phone) return;
+// ========== ADMIN FORMATTING (always Russian) ==========
+function formatDate(timestamp, options = {}) {
+    return new Date(timestamp).toLocaleString('ru-RU', { timeZone: 'Asia/Tashkent', ...options });
+}
 
-    const lang = session.lang || 'ru';
-    const cancelMessage = `❌ Заказ отменён пользователем.\n\n👤 ${sanitizeText(session.name)}\n📞 ${session.phone}`;
+function formatOrderForAdmin(order) {
+    return `🆔 Заказ #${order.shortId}\n\n` +
+        `👤 Клиент: ${order.name}\n` +
+        `📞 Телефон: ${order.phone}\n` +
+        `📍 Локация: ${mapsLink(order.location)}\n` +
+        `🔪 Ножей: ${order.knives}\n` +
+        `📷 Фото: ${order.photos ? order.photos.length : 0}\n` +
+        `🌐 Язык: ${order.lang === 'ru' ? '🇷🇺 Русский' : '🇺🇿 Узбекский'}\n` +
+        `📅 ${formatDate(order.createdAt)}`;
+}
 
+function orderReadyKeyboard(orderId) {
+    return Markup.inlineKeyboard([
+        Markup.button.callback('✅ Заказ готов', `order_ready:${orderId}`)
+    ]);
+}
+
+async function notifyGroupOrderCancelled(order, reason) {
+    const text = `❌ Заказ #${order.shortId} отменён пользователем${reason ? ` (${reason})` : ''}.\n\n` +
+        `👤 ${order.name}\n📞 ${order.phone}`;
     try {
-        await bot.telegram.sendMessage(config.groupChatId, cancelMessage);
-        logger.info('Cancellation notification sent', { name: session.name, phone: session.phone });
+        await withRetry(() => bot.telegram.sendMessage(config.groupChatId, text));
     } catch (error) {
-        logger.error('Failed to send cancellation notification', error, { session });
+        logger.error('Failed to send cancellation to group', error, { orderId: order.orderId });
     }
 }
 
-async function sendOrderToGroup(session, orderId, shortId) {
-    try {
-        // Send all photos with captions
-        if (session.photos && session.photos.length > 0) {
-            for (let i = 0; i < session.photos.length; i++) {
-                const photoId = session.photos[i];
-                const photoCaption = `📷 Фото ${i + 1}/${session.photos.length}\n` +
-                    `🆔 Заказ #${shortId}\n` +
-                    `👤 ${sanitizeText(session.name)}\n` +
-                    `📞 ${session.phone}\n` +
-                    `🔪 Ножей: ${session.knives}\n` +
-                    `🌐 ${session.lang === 'ru' ? '🇷🇺 RU' : '🇺🇿 UZ'}\n` +
-                    `📅 ${new Date().toLocaleString('ru-RU', { timeZone: 'Asia/Tashkent' })}\n` +
-                    `\n💡 ID для поиска: ${orderId}`;
+async function sendOrderToGroup(order) {
+    const photos = order.photos || [];
 
-                await bot.telegram.sendPhoto(config.groupChatId, photoId, {
-                    caption: photoCaption
-                });
-            }
+    // Photos go as albums (up to 10 per message) to stay within Telegram group limits
+    for (let i = 0; i < photos.length; i += MEDIA_GROUP_MAX_SIZE) {
+        const chunk = photos.slice(i, i + MEDIA_GROUP_MAX_SIZE);
+        const caption = `📷 Заказ #${order.shortId} — фото ${i + 1}–${i + chunk.length} из ${photos.length}`;
+
+        if (chunk.length === 1) {
+            await withRetry(() => bot.telegram.sendPhoto(config.groupChatId, chunk[0], { caption }));
+        } else {
+            const media = chunk.map((fileId, index) => ({
+                type: 'photo',
+                media: fileId,
+                ...(index === 0 ? { caption } : {})
+            }));
+            await withRetry(() => bot.telegram.sendMediaGroup(config.groupChatId, media));
         }
-
-        // Send order summary with action button
-        const groupMessage = messages[session.lang].summary(session);
-        const enhancedGroupMessage = `🆔 Заказ #${shortId}\n\n${groupMessage}`;
-
-        await bot.telegram.sendMessage(
-            config.groupChatId,
-            enhancedGroupMessage,
-            Markup.inlineKeyboard([
-                Markup.button.callback(
-                    session.lang === 'ru' ? 'Заказ готов' : 'Buyurtma tayyor',
-                    `order_ready:${orderId}`
-                )
-            ])
-        );
-
-        logger.info('Order sent to group', { orderId, shortId, photoCount: session.photos?.length || 0 });
-    } catch (error) {
-        logger.error('Failed to send order to group', error, { orderId, shortId });
-        throw error;
     }
+
+    await withRetry(() => bot.telegram.sendMessage(
+        config.groupChatId,
+        formatOrderForAdmin(order),
+        orderReadyKeyboard(order.orderId)
+    ));
+
+    logger.info('Order sent to group', { orderId: order.orderId, shortId: order.shortId, photoCount: photos.length });
 }
 
-// ========== RATE LIMITING MIDDLEWARE ==========
-// Rate limiting disabled - users can send unlimited messages
-// bot.use(async (ctx, next) => {
-//     const userId = ctx.from?.id;
-//     if (!userId) return next();
-
-//     // Check rate limit
-//     const allowed = db.checkRateLimit(userId, RATE_LIMIT_MAX_MESSAGES, RATE_LIMIT_WINDOW_MS);
-//     if (!allowed) {
-//         const session = db.getSession(userId);
-//         const lang = session?.lang || 'ru';
-//         logger.warn('Rate limit exceeded', { userId });
-//         return ctx.reply(messages[lang].rate_limited);
-//     }
-
-//     return next();
-// });
-
-// ========== MESSAGE TYPE FILTERING ==========
-bot.on('message', (ctx, next) => {
-    const msg = ctx.message;
-    const allowed = msg.text || msg.location || msg.contact || msg.photo;
-    if (allowed) return next();
-
-    const session = db.getSession(ctx.from.id);
-    const lang = session?.lang || 'ru';
-    const reply = messages[lang]?.only_text || '❌ Ошибка.';
-    return ctx.reply(reply);
-});
-
-// ========== COMMAND: /start ==========
-bot.start(async (ctx) => {
-    try {
-        const userId = ctx.from.id;
-        const oldSession = db.getSession(userId);
-
-        // Notify if cancelling existing session
-        if (oldSession) {
-            await notifyCancellation(oldSession);
-        }
-
-        // Create new session
-        db.saveSession(userId, { step: 'lang' });
-
-        await ctx.reply(
-            `${messages.ru.welcome}\n${messages.uz.welcome}`,
-            Markup.keyboard([['Русский 🇷🇺', "O'zbek 🇺🇿"]]).oneTime().resize()
-        );
-
-        logger.info('User started bot', { userId });
-    } catch (error) {
-        logger.error('Error in /start command', error, { userId: ctx.from?.id });
-        await ctx.reply('❌ Произошла ошибка. Попробуйте позже.');
+function renderOrdersPage(requestedPage) {
+    const totalOrders = db.getActiveOrdersCount();
+    if (totalOrders === 0) {
+        return { text: '📋 Нет активных заказов', keyboard: null, page: 0, totalOrders };
     }
-});
 
-// ========== COMMAND: /find (Admin only) ==========
+    const lastPage = Math.ceil(totalOrders / ORDERS_PAGE_SIZE) - 1;
+    const page = Math.min(Math.max(requestedPage, 0), lastPage);
+    const orders = db.getActiveOrders(ORDERS_PAGE_SIZE, page * ORDERS_PAGE_SIZE);
+
+    let text = `📋 Активные заказы (${totalOrders}), стр. ${page + 1}/${lastPage + 1}:\n\n`;
+    for (const order of orders) {
+        const orderTime = formatDate(order.createdAt, {
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+        text += `🆔 #${order.shortId}\n` +
+            `👤 ${order.name}\n` +
+            `📞 ${order.phone}\n` +
+            `🔪 ${order.knives} ножей\n` +
+            `📷 ${order.photos ? order.photos.length : 0} фото\n` +
+            `📅 ${orderTime}\n\n`;
+    }
+
+    const buttons = [];
+    if (page > 0) {
+        buttons.push(Markup.button.callback('◀️ Назад', `orders_page:${page - 1}`));
+    }
+    if (page < lastPage) {
+        buttons.push(Markup.button.callback('Вперед ▶️', `orders_page:${page + 1}`));
+    }
+
+    return {
+        text,
+        keyboard: buttons.length > 0 ? Markup.inlineKeyboard([buttons]) : null,
+        page,
+        totalOrders
+    };
+}
+
+// ========== ADMIN HANDLERS (group chat) ==========
 bot.command('find', requireAdmin, async (ctx) => {
     try {
-        const args = ctx.message.text.split(' ');
-        if (args.length < 2) {
-            return ctx.reply('Использование: /find 123456\nПример: /find 245891');
+        const arg = (ctx.payload || '').trim().replace(/^#/, '');
+        if (!/^\d+$/.test(arg)) {
+            return ctx.reply('Использование: /find 000123\nПример: /find 123');
         }
 
-        const searchId = args[1].trim();
+        const searchId = arg.padStart(SHORT_ID_LENGTH, '0');
         const order = db.getOrderByShortId(searchId);
 
         if (!order) {
             return ctx.reply(`❌ Заказ #${searchId} не найден или уже завершен.`);
         }
 
-        const orderInfo = `🔍 Найден заказ #${searchId}\n\n` +
-            `👤 Клиент: ${sanitizeText(order.name)}\n` +
-            `📞 Телефон: ${order.phone}\n` +
-            `🔪 Ножей: ${order.knives}\n` +
-            `🌐 Язык: ${order.lang === 'ru' ? '🇷🇺 Русский' : '🇺🇿 Узбекский'}\n` +
-            `📷 Фото: ${order.photos ? order.photos.length : 0}\n` +
-            `📍 Локация: https://www.google.com/maps?q=${order.location.latitude},${order.location.longitude}\n` +
-            `🆔 Полный ID: ${order.orderId}`;
-
-        await ctx.reply(orderInfo, Markup.inlineKeyboard([
-            Markup.button.callback('Заказ готов', `order_ready:${order.orderId}`)
-        ]));
+        await ctx.reply(`🔍 Найден заказ\n\n${formatOrderForAdmin(order)}`, orderReadyKeyboard(order.orderId));
 
         logger.info('Order found by admin', { orderId: order.orderId, shortId: searchId, userId: ctx.from.id });
     } catch (error) {
@@ -382,55 +398,10 @@ bot.command('find', requireAdmin, async (ctx) => {
     }
 });
 
-// ========== COMMAND: /orders (Admin only) ==========
 bot.command('orders', requireAdmin, async (ctx) => {
     try {
-        const page = 0; // Default to first page
-        const pageSize = 10;
-
-        const totalOrders = db.getActiveOrdersCount();
-
-        if (totalOrders === 0) {
-            return ctx.reply('📋 Нет активных заказов');
-        }
-
-        const orders = db.getActiveOrders(pageSize, page * pageSize);
-        let ordersList = `📋 Активные заказы (${totalOrders}):\n\n`;
-
-        orders.forEach(order => {
-            const orderTime = new Date(order.createdAt).toLocaleString('ru-RU', {
-                timeZone: 'Asia/Tashkent',
-                month: 'short',
-                day: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit'
-            });
-
-            ordersList += `🆔 #${order.shortId}\n` +
-                `👤 ${sanitizeText(order.name)}\n` +
-                `📞 ${order.phone}\n` +
-                `🔪 ${order.knives} ножей\n` +
-                `📷 ${order.photos ? order.photos.length : 0} фото\n` +
-                `📅 ${orderTime}\n\n`;
-        });
-
-        // Add pagination buttons if needed
-        const buttons = [];
-        if (totalOrders > pageSize) {
-            if (page > 0) {
-                buttons.push(Markup.button.callback('◀️ Назад', `orders_page:${page - 1}`));
-            }
-            if ((page + 1) * pageSize < totalOrders) {
-                buttons.push(Markup.button.callback('Вперед ▶️', `orders_page:${page + 1}`));
-            }
-        }
-
-        if (buttons.length > 0) {
-            await ctx.reply(ordersList, Markup.inlineKeyboard([buttons]));
-        } else {
-            await ctx.reply(ordersList);
-        }
-
+        const { text, keyboard, page, totalOrders } = renderOrdersPage(0);
+        await ctx.reply(text, keyboard || undefined);
         logger.info('Orders list viewed', { userId: ctx.from.id, page, totalOrders });
     } catch (error) {
         logger.error('Error in /orders command', error, { userId: ctx.from?.id });
@@ -438,65 +409,125 @@ bot.command('orders', requireAdmin, async (ctx) => {
     }
 });
 
-// ========== PAGINATION CALLBACK ==========
-bot.action(/orders_page:(\d+)/, requireAdmin, async (ctx) => {
+bot.action(/^orders_page:(\d+)$/, requireAdmin, async (ctx) => {
     try {
-        const page = parseInt(ctx.match[1]);
-        const pageSize = 10;
-
-        const totalOrders = db.getActiveOrdersCount();
-        const orders = db.getActiveOrders(pageSize, page * pageSize);
-
-        let ordersList = `📋 Активные заказы (${totalOrders}):\n\n`;
-
-        orders.forEach(order => {
-            const orderTime = new Date(order.createdAt).toLocaleString('ru-RU', {
-                timeZone: 'Asia/Tashkent',
-                month: 'short',
-                day: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit'
-            });
-
-            ordersList += `🆔 #${order.shortId}\n` +
-                `👤 ${sanitizeText(order.name)}\n` +
-                `📞 ${order.phone}\n` +
-                `🔪 ${order.knives} ножей\n` +
-                `📷 ${order.photos ? order.photos.length : 0} фото\n` +
-                `📅 ${orderTime}\n\n`;
-        });
-
-        const buttons = [];
-        if (page > 0) {
-            buttons.push(Markup.button.callback('◀️ Назад', `orders_page:${page - 1}`));
+        const { text, keyboard, page, totalOrders } = renderOrdersPage(Number(ctx.match[1]));
+        try {
+            await ctx.editMessageText(text, keyboard || undefined);
+        } catch (e) {
+            // Message unchanged
         }
-        if ((page + 1) * pageSize < totalOrders) {
-            buttons.push(Markup.button.callback('Вперед ▶️', `orders_page:${page + 1}`));
-        }
-
-        await ctx.editMessageText(ordersList, Markup.inlineKeyboard([buttons]));
-        await ctx.answerCbQuery();
-
+        await safeAnswerCbQuery(ctx);
         logger.info('Orders pagination', { userId: ctx.from.id, page, totalOrders });
     } catch (error) {
         logger.error('Error in orders pagination', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
+    }
+});
+
+bot.action(/^order_ready:(.+)$/, requireAdmin, async (ctx) => {
+    try {
+        const order = db.completeOrder(ctx.match[1], 'completed');
+
+        if (!order) {
+            return safeAnswerCbQuery(ctx, 'Заказ уже обработан или не найден.');
+        }
+
+        try {
+            await ctx.editMessageText(`${formatOrderForAdmin(order)}\n\n✅ Заказ готов.`);
+        } catch (e) {
+            logger.error('Error editing message', e, { orderId: order.orderId });
+        }
+
+        await safeAnswerCbQuery(ctx, 'Заказ отмечен как готов.');
+        logger.info('Order marked ready by admin', { orderId: order.orderId, adminId: ctx.from.id });
+    } catch (error) {
+        logger.error('Error marking order ready', error, { userId: ctx.from?.id });
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
+    }
+});
+
+// ========== PRIVATE CHAT ONLY BELOW ==========
+// Customer handlers must not react to messages in the admin group or any other chat
+bot.use(async (ctx, next) => {
+    if (ctx.chat?.type !== 'private' || !ctx.from) {
+        if (ctx.callbackQuery) await safeAnswerCbQuery(ctx);
+        return;
+    }
+    return next();
+});
+
+// ========== RATE LIMITING ==========
+bot.use(async (ctx, next) => {
+    const userId = ctx.from.id;
+    const { allowed, firstBlocked } = db.checkRateLimit(userId, RATE_LIMIT_MAX_MESSAGES, RATE_LIMIT_WINDOW_MS);
+    if (allowed) return next();
+
+    const lang = db.getSession(userId)?.lang;
+    if (ctx.callbackQuery) {
+        return safeAnswerCbQuery(ctx, t(lang).rate_limited);
+    }
+    if (firstBlocked) {
+        logger.warn('Rate limit exceeded', { userId });
+        return ctx.reply(t(lang).rate_limited);
+    }
+});
+
+// ========== MESSAGE TYPE FILTERING ==========
+bot.on('message', (ctx, next) => {
+    const msg = ctx.message;
+    const allowed = msg.text || msg.location || msg.contact || msg.photo;
+    if (allowed) return next();
+
+    const session = db.getSession(ctx.from.id);
+    return ctx.reply(t(session?.lang).only_text);
+});
+
+// ========== FLOW HELPERS ==========
+// Drops an unfinished draft. Drafts were never sent to admins, so admins are not notified.
+async function startNewSession(ctx) {
+    db.saveSession(ctx.from.id, { step: 'lang' });
+    await ctx.reply(`${messages.ru.welcome}\n${messages.uz.welcome}`, languageKeyboard());
+}
+
+async function cancelUserActiveOrders(userId, reason) {
+    const activeOrders = db.getUserActiveOrders(userId);
+    for (const activeOrder of activeOrders) {
+        const archived = db.cancelOrder(activeOrder.orderId);
+        if (archived) await notifyGroupOrderCancelled(archived, reason);
+    }
+    return activeOrders.length;
+}
+
+async function sendPhotoStatus(chatId, userId, rejected = false) {
+    const session = db.getSession(userId);
+    if (!session || session.step !== 'photo') return;
+
+    const m = t(session.lang);
+    const count = session.photos.length;
+    let text = count > 0 ? m.photo_received(count) : m.ask_photo;
+    if (rejected) text += `\n\n${m.photo_limit}`;
+
+    await bot.telegram.sendMessage(chatId, text, buildPhotoManagementKeyboard(session.lang, count > 0));
+}
+
+// ========== COMMAND: /start ==========
+bot.start(async (ctx) => {
+    try {
+        await startNewSession(ctx);
+        logger.info('User started bot', { userId: ctx.from.id });
+    } catch (error) {
+        logger.error('Error in /start command', error, { userId: ctx.from?.id });
+        await ctx.reply(messages.ru.error);
     }
 });
 
 // ========== COMMAND: /cancel ==========
 bot.command('cancel', async (ctx) => {
     try {
-        const userId = ctx.from.id;
-        const oldSession = db.getSession(userId);
-
-        if (oldSession) {
-            await notifyCancellation(oldSession);
-            db.deleteSession(userId);
-        }
-
+        db.deleteSession(ctx.from.id);
         await ctx.reply(`${messages.ru.cancel}\n${messages.uz.cancel}`, Markup.removeKeyboard());
-        logger.info('User cancelled order', { userId });
+        logger.info('User cancelled draft', { userId: ctx.from.id });
     } catch (error) {
         logger.error('Error in /cancel command', error, { userId: ctx.from?.id });
     }
@@ -507,79 +538,77 @@ bot.on('text', async (ctx) => {
     try {
         const text = ctx.message.text.trim();
         const userId = ctx.from.id;
-        let session = db.getSession(userId);
+        const session = db.getSession(userId);
 
         // Handle restart button
         if ([messages.ru.restart, messages.uz.restart].includes(text)) {
-            if (session) {
-                await notifyCancellation(session);
-            }
-            db.saveSession(userId, { step: 'lang' });
-            return ctx.reply(
-                `${messages.ru.welcome}\n${messages.uz.welcome}`,
-                Markup.keyboard([['Русский 🇷🇺', "O'zbek 🇺🇿"]]).oneTime().resize()
-            );
+            return startNewSession(ctx);
         }
 
         if (!session) {
             return ctx.reply('Пожалуйста, начните с /start\nIltimos, /start dan boshlang');
         }
 
-        // Language selection
-        if (session.step === 'lang') {
-            const lang = text.includes('Русский') ? 'ru' : 'uz';
-            session.lang = lang;
-            session.step = 'name';
-            db.saveSession(userId, session);
-            return ctx.reply(messages[lang].ask_name, Markup.removeKeyboard());
-        }
+        const m = t(session.lang);
 
-        // Name input
-        if (session.step === 'name') {
-            if (!isValidName(text)) {
-                return ctx.reply(messages[session.lang].invalid_name);
+        switch (session.step) {
+            case 'lang': {
+                const lang = LANGUAGE_BUTTONS[text];
+                if (!lang) {
+                    return ctx.reply(`${messages.ru.welcome}\n${messages.uz.welcome}`, languageKeyboard());
+                }
+                session.lang = lang;
+                session.step = 'name';
+                db.saveSession(userId, session);
+                return ctx.reply(messages[lang].ask_name, Markup.removeKeyboard());
             }
-            session.name = sanitizeText(text.trim());
-            session.step = 'phone';
-            db.saveSession(userId, session);
-            return ctx.reply(
-                messages[session.lang].ask_phone,
-                Markup.keyboard([
-                    [Markup.button.contactRequest('📞 ' + (session.lang === 'ru' ? 'Отправить мой номер' : 'Raqamni yuborish'))]
-                ]).oneTime().resize()
-            );
-        }
 
-        // Phone input
-        if (session.step === 'phone') {
-            if (!isValidUzbekPhone(text)) {
-                return ctx.reply(messages[session.lang].invalid_phone);
+            case 'name': {
+                if (!isValidName(text)) {
+                    return ctx.reply(m.invalid_name);
+                }
+                session.name = text;
+                session.step = 'phone';
+                db.saveSession(userId, session);
+                return ctx.reply(m.ask_phone, phoneKeyboard(session.lang));
             }
-            session.phone = normalizeUzbekPhone(text);
-            session.step = 'location';
-            db.saveSession(userId, session);
-            return ctx.reply(
-                messages[session.lang].ask_location,
-                Markup.keyboard([
-                    [Markup.button.locationRequest(messages[session.lang].location_button)]
-                ]).oneTime().resize()
-            );
-        }
 
-        // Knives count
-        if (session.step === 'knives') {
-            if (!isValidKnivesCount(text)) {
-                return ctx.reply(messages[session.lang].invalid_knives);
+            case 'phone': {
+                const phone = normalizeUzbekPhone(text);
+                if (!phone) {
+                    return ctx.reply(m.invalid_phone, phoneKeyboard(session.lang));
+                }
+                session.phone = phone;
+                session.step = 'location';
+                db.saveSession(userId, session);
+                return ctx.reply(m.ask_location, locationKeyboard(session.lang));
             }
-            session.knives = parseInt(text);
-            session.step = 'photo';
-            session.photos = [];
-            db.saveSession(userId, session);
-            return ctx.reply(messages[session.lang].ask_photo, Markup.removeKeyboard());
+
+            case 'location':
+                // Text addresses are not accepted: ask for the location button again
+                return ctx.reply(m.ask_location, locationKeyboard(session.lang));
+
+            case 'knives': {
+                const knives = parseKnivesCount(text);
+                if (knives === null) {
+                    return ctx.reply(m.invalid_knives);
+                }
+                session.knives = knives;
+                session.step = 'photo';
+                session.photos = [];
+                db.saveSession(userId, session);
+                return ctx.reply(m.ask_photo, Markup.removeKeyboard());
+            }
+
+            case 'photo':
+                return sendPhotoStatus(ctx.chat.id, userId);
+
+            default:
+                return startNewSession(ctx);
         }
     } catch (error) {
-        logger.error('Error in text handler', error, { userId: ctx.from?.id, text: ctx.message?.text });
-        await ctx.reply('❌ Произошла ошибка. Попробуйте позже или используйте /cancel для сброса.');
+        logger.error('Error in text handler', error, { userId: ctx.from?.id });
+        await ctx.reply(messages.ru.error);
     }
 });
 
@@ -590,26 +619,25 @@ bot.on('location', async (ctx) => {
         const session = db.getSession(userId);
 
         if (!session) {
-            const lang = 'ru';
-            return ctx.reply(messages[lang].session_expired);
+            return ctx.reply(messages.ru.session_expired);
         }
 
-        if (session.step === 'location') {
-            const location = sanitizeLocation(ctx.message.location);
-            if (!location) {
-                return ctx.reply(session.lang === 'ru' ?
-                    '❌ Некорректная локация. Попробуйте снова.' :
-                    '❌ Noto\'g\'ri joylashuv. Qayta urinib ko\'ring.');
-            }
-
-            session.location = location;
-            session.step = 'knives';
-            db.saveSession(userId, session);
-            await ctx.reply(messages[session.lang].ask_knives, Markup.removeKeyboard());
+        if (session.step !== 'location') {
+            return;
         }
+
+        const location = sanitizeLocation(ctx.message.location);
+        if (!location) {
+            return ctx.reply(t(session.lang).invalid_location, locationKeyboard(session.lang));
+        }
+
+        session.location = location;
+        session.step = 'knives';
+        db.saveSession(userId, session);
+        await ctx.reply(t(session.lang).ask_knives, Markup.removeKeyboard());
     } catch (error) {
         logger.error('Error in location handler', error, { userId: ctx.from?.id });
-        await ctx.reply('❌ Произошла ошибка. Попробуйте позже.');
+        await ctx.reply(messages.ru.error);
     }
 });
 
@@ -623,27 +651,26 @@ bot.on('contact', async (ctx) => {
             return;
         }
 
-        const phone = ctx.message.contact.phone_number;
-        if (!isValidUzbekPhone(phone)) {
-            return ctx.reply(messages[session.lang].invalid_phone);
+        const phone = normalizeUzbekPhone(ctx.message.contact.phone_number);
+        if (!phone) {
+            return ctx.reply(t(session.lang).invalid_phone, phoneKeyboard(session.lang));
         }
 
-        session.phone = normalizeUzbekPhone(phone);
+        session.phone = phone;
         session.step = 'location';
         db.saveSession(userId, session);
-        await ctx.reply(
-            messages[session.lang].ask_location,
-            Markup.keyboard([
-                [Markup.button.locationRequest(messages[session.lang].location_button)]
-            ]).oneTime().resize()
-        );
+        await ctx.reply(t(session.lang).ask_location, locationKeyboard(session.lang));
     } catch (error) {
         logger.error('Error in contact handler', error, { userId: ctx.from?.id });
-        await ctx.reply('❌ Произошла ошибка. Попробуйте позже.');
+        await ctx.reply(messages.ru.error);
     }
 });
 
-// ========== PHOTO HANDLER (Fixed race condition) ==========
+// ========== PHOTO HANDLER ==========
+// Albums arrive as separate updates processed concurrently. Each photo is appended in a
+// single DB transaction (no stale read-modify-write), and one status reply is sent per album.
+const pendingAlbums = new Map();
+
 bot.on('photo', async (ctx) => {
     try {
         const userId = ctx.from.id;
@@ -653,27 +680,30 @@ bot.on('photo', async (ctx) => {
             return;
         }
 
-        // Add photo to array
-        if (!session.photos) session.photos = [];
         const photoId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-        session.photos.push(photoId);
+        const count = db.addSessionPhoto(userId, photoId, MAX_PHOTOS_PER_ORDER);
+        const rejected = count === null;
 
-        // Save immediately to prevent race conditions
-        db.saveSession(userId, session);
+        const mediaGroupId = ctx.message.media_group_id;
+        if (mediaGroupId) {
+            const key = `${userId}:${mediaGroupId}`;
+            const entry = pendingAlbums.get(key) || { rejected: false };
+            clearTimeout(entry.timer);
+            entry.rejected = entry.rejected || rejected;
+            entry.timer = setTimeout(() => {
+                pendingAlbums.delete(key);
+                sendPhotoStatus(ctx.chat.id, userId, entry.rejected)
+                    .catch(error => logger.error('Failed to send album status', error, { userId }));
+            }, ALBUM_DEBOUNCE_MS);
+            pendingAlbums.set(key, entry);
+        } else {
+            await sendPhotoStatus(ctx.chat.id, userId, rejected);
+        }
 
-        const count = session.photos.length;
-        const text = messages[session.lang].photo_received(count);
-        const keyboard = buildPhotoManagementKeyboard(session.lang, true);
-
-        // Send new message with buttons
-        const msg = await ctx.reply(text, keyboard);
-        session.lastPhotoMessageId = msg.message_id;
-        db.saveSession(userId, session);
-
-        logger.info('Photo added', { userId, photoCount: count });
+        logger.info('Photo received', { userId, photoCount: count, rejected });
     } catch (error) {
         logger.error('Error in photo handler', error, { userId: ctx.from?.id });
-        await ctx.reply('❌ Произошла ошибка при загрузке фото. Попробуйте снова.');
+        await ctx.reply(messages.ru.error);
     }
 });
 
@@ -684,159 +714,137 @@ bot.action('photos_done', async (ctx) => {
         const session = db.getSession(userId);
 
         if (!session || session.step !== 'photo') {
-            return ctx.answerCbQuery(messages.ru.session_expired);
+            return safeAnswerCbQuery(ctx, messages.ru.session_expired);
         }
 
+        const m = t(session.lang);
         if (!session.photos || session.photos.length === 0) {
-            return ctx.answerCbQuery(messages[session.lang].at_least_one_photo);
+            return safeAnswerCbQuery(ctx, m.at_least_one_photo);
         }
 
-        // Create order in database
-        const { orderId, shortId } = db.createOrder(userId, session);
+        // Synchronous and atomic: a second tap finds no session and cannot create a duplicate
+        const { orderId, shortId, createdAt } = db.placeOrderFromSession(userId, session);
+        const order = { ...session, orderId, shortId, createdAt, creatorId: userId };
 
-        // Send confirmation to user
-        const successMessage = messages[session.lang].order_sent(session.photos.length);
-        await ctx.reply(successMessage);
+        await safeAnswerCbQuery(ctx);
+        try {
+            await ctx.editMessageReplyMarkup(undefined);
+        } catch (e) {
+            // Message too old or already edited
+        }
 
-        // Send order summary to user
+        // The order is already saved, so admins can see it with /orders even if delivery fails
+        try {
+            await sendOrderToGroup(order);
+        } catch (error) {
+            logger.error('Failed to send order to group, available via /orders', error, { orderId, shortId });
+        }
+
+        await ctx.reply(m.order_sent(session.photos.length));
         await ctx.reply(
-            messages[session.lang].summary(session),
+            m.summary(order),
             Markup.inlineKeyboard([
-                Markup.button.callback(
-                    session.lang === 'ru' ? 'Отменить заказ' : 'Buyurtmani bekor qilish',
-                    `cancel_order:${orderId}`
-                ),
-                Markup.button.callback(
-                    messages[session.lang].restart,
-                    'restart'
-                )
+                Markup.button.callback(m.cancel_order, `cancel_order:${orderId}`),
+                Markup.button.callback(m.restart, 'restart')
             ])
         );
 
-        // Send to admin group
-        await sendOrderToGroup(session, orderId, shortId);
-
-        // Clear session
-        db.deleteSession(userId);
-        await ctx.answerCbQuery();
-
-        logger.info('Order completed', { userId, orderId, shortId, photoCount: session.photos.length });
+        logger.info('Order placed', { userId, orderId, shortId, photoCount: session.photos.length });
     } catch (error) {
         logger.error('Error completing order', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка при отправке заказа');
-        await ctx.reply('❌ Произошла ошибка при отправке заказа. Попробуйте позже или обратитесь в поддержку.');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка при отправке заказа');
+        await ctx.reply(messages.ru.error);
     }
 });
 
 bot.action('photos_add', async (ctx) => {
     try {
-        const userId = ctx.from.id;
-        const session = db.getSession(userId);
+        const session = db.getSession(ctx.from.id);
 
         if (!session || session.step !== 'photo') {
-            return ctx.answerCbQuery(messages.ru.session_expired);
+            return safeAnswerCbQuery(ctx, messages.ru.session_expired);
         }
 
-        const count = session.photos ? session.photos.length : 0;
-        const text = messages[session.lang].photo_received(count);
-        const keyboard = buildPhotoManagementKeyboard(session.lang, count > 0);
-
-        try {
-            await ctx.editMessageText(text, keyboard);
-        } catch (e) {
-            // Message unchanged, ignore
-        }
-
-        const addPhotoMessage = session.lang === 'ru'
-            ? '📸 Отправьте ещё одно фото или несколько фото'
-            : '📸 Yana bir yoki bir nechta foto yuboring';
-        await ctx.reply(addPhotoMessage, keyboard);
-        await ctx.answerCbQuery();
+        await ctx.reply(t(session.lang).add_more_photos);
+        await safeAnswerCbQuery(ctx);
     } catch (error) {
         logger.error('Error in photos_add', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
     }
 });
 
 bot.action('photos_delete', async (ctx) => {
     try {
-        const userId = ctx.from.id;
-        const session = db.getSession(userId);
+        const session = db.getSession(ctx.from.id);
 
-        if (!session || session.step !== 'photo' || !session.photos || session.photos.length === 0) {
-            const lang = session?.lang || 'ru';
-            return ctx.answerCbQuery(messages[lang].no_photos);
+        if (!session || session.step !== 'photo' || session.photos.length === 0) {
+            return safeAnswerCbQuery(ctx, t(session?.lang).no_photos);
         }
 
+        const m = t(session.lang);
         const buttons = session.photos.map((_, index) =>
-            Markup.button.callback(`Фото ${index + 1}`, `delete_photo:${index}`)
+            Markup.button.callback(m.photo_label(index + 1), `delete_photo:${index}`)
         );
         const keyboard = [];
         for (let i = 0; i < buttons.length; i += 2) {
             keyboard.push(buttons.slice(i, i + 2));
         }
-        keyboard.push([Markup.button.callback('⬅️ Назад', 'photos_back')]);
+        keyboard.push([Markup.button.callback(m.back, 'photos_back')]);
 
-        await ctx.editMessageText(
-            messages[session.lang].select_photo_delete,
-            Markup.inlineKeyboard(keyboard)
-        );
-        await ctx.answerCbQuery();
+        await ctx.editMessageText(m.select_photo_delete, Markup.inlineKeyboard(keyboard));
+        await safeAnswerCbQuery(ctx);
     } catch (error) {
         logger.error('Error in photos_delete', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
     }
 });
 
-bot.action(/delete_photo:(\d+)/, async (ctx) => {
+bot.action(/^delete_photo:(\d+)$/, async (ctx) => {
     try {
         const userId = ctx.from.id;
         const session = db.getSession(userId);
-        const photoIndex = parseInt(ctx.match[1]);
+        const photoIndex = Number(ctx.match[1]);
 
-        if (!session || session.step !== 'photo' || !session.photos || photoIndex >= session.photos.length) {
-            return ctx.answerCbQuery('Ошибка удаления фото');
+        if (!session || session.step !== 'photo' || photoIndex >= session.photos.length) {
+            return safeAnswerCbQuery(ctx, t(session?.lang).no_photos);
         }
 
         session.photos.splice(photoIndex, 1);
         db.saveSession(userId, session);
 
+        const m = t(session.lang);
         const count = session.photos.length;
-        const keyboard = buildPhotoManagementKeyboard(session.lang, count > 0);
-
         await ctx.editMessageText(
-            count > 0 ? messages[session.lang].photo_received(count) : messages[session.lang].ask_photo,
-            keyboard
+            count > 0 ? m.photo_received(count) : m.ask_photo,
+            buildPhotoManagementKeyboard(session.lang, count > 0)
         );
-        await ctx.answerCbQuery(messages[session.lang].photo_deleted);
+        await safeAnswerCbQuery(ctx, m.photo_deleted);
 
         logger.info('Photo deleted', { userId, photoIndex, remainingCount: count });
     } catch (error) {
         logger.error('Error deleting photo', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
     }
 });
 
 bot.action('photos_back', async (ctx) => {
     try {
-        const userId = ctx.from.id;
-        const session = db.getSession(userId);
+        const session = db.getSession(ctx.from.id);
 
         if (!session || session.step !== 'photo') {
-            return ctx.answerCbQuery(messages.ru.session_expired);
+            return safeAnswerCbQuery(ctx, messages.ru.session_expired);
         }
 
-        const count = session.photos ? session.photos.length : 0;
-        const keyboard = buildPhotoManagementKeyboard(session.lang, count > 0);
-
+        const m = t(session.lang);
+        const count = session.photos.length;
         await ctx.editMessageText(
-            count > 0 ? messages[session.lang].photo_received(count) : messages[session.lang].ask_photo,
-            keyboard
+            count > 0 ? m.photo_received(count) : m.ask_photo,
+            buildPhotoManagementKeyboard(session.lang, count > 0)
         );
-        await ctx.answerCbQuery();
+        await safeAnswerCbQuery(ctx);
     } catch (error) {
         logger.error('Error in photos_back', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
     }
 });
 
@@ -845,65 +853,51 @@ bot.action('photos_view', async (ctx) => {
         const userId = ctx.from.id;
         const session = db.getSession(userId);
 
-        if (!session || session.step !== 'photo' || !session.photos || session.photos.length === 0) {
-            return ctx.answerCbQuery('Нет фотографий для просмотра');
+        if (!session || session.step !== 'photo' || session.photos.length === 0) {
+            return safeAnswerCbQuery(ctx, t(session?.lang).no_photos);
         }
 
-        const viewMessage = session.lang === 'ru'
-            ? `📷 Показываю все ваши фото (${session.photos.length}):`
-            : `📷 Barcha fotolaringizni ko'rsatyapman (${session.photos.length}):`;
-        await ctx.reply(viewMessage);
-
-        // Use media groups if possible (up to 10 photos at once)
+        const m = t(session.lang);
         const photos = session.photos;
+        await safeAnswerCbQuery(ctx);
+        await ctx.reply(m.photos_shown(photos.length));
+
         for (let i = 0; i < photos.length; i += MEDIA_GROUP_MAX_SIZE) {
             const chunk = photos.slice(i, i + MEDIA_GROUP_MAX_SIZE);
             if (chunk.length === 1) {
                 await ctx.replyWithPhoto(chunk[0]);
             } else {
-                await ctx.replyWithMediaGroup(
-                    chunk.map(photoId => ({ type: 'photo', media: photoId }))
-                );
+                await ctx.replyWithMediaGroup(chunk.map(photoId => ({ type: 'photo', media: photoId })));
             }
         }
 
-        const controlKeyboard = buildPhotoManagementKeyboard(session.lang, true);
-        const controlMessage = session.lang === 'ru'
-            ? `📷 Все фото показаны. Выберите действие:`
-            : `📷 Barcha fotolar ko'rsatildi. Amalni tanlang:`;
-
-        await ctx.reply(controlMessage, controlKeyboard);
-        await ctx.answerCbQuery();
-
+        await ctx.reply(m.photos_shown_done, buildPhotoManagementKeyboard(session.lang, true));
         logger.info('Photos viewed', { userId, photoCount: photos.length });
     } catch (error) {
         logger.error('Error viewing photos', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
     }
 });
 
 bot.action('photos_delete_all', async (ctx) => {
     try {
-        const userId = ctx.from.id;
-        const session = db.getSession(userId);
+        const session = db.getSession(ctx.from.id);
 
-        if (!session || session.step !== 'photo' || !session.photos || session.photos.length === 0) {
-            const lang = session?.lang || 'ru';
-            return ctx.answerCbQuery(messages[lang].no_photos);
+        if (!session || session.step !== 'photo' || session.photos.length === 0) {
+            return safeAnswerCbQuery(ctx, t(session?.lang).no_photos);
         }
 
-        const confirmKeyboard = Markup.inlineKeyboard([
+        const m = t(session.lang);
+        await ctx.reply(m.confirm_delete_all, Markup.inlineKeyboard([
             [
-                Markup.button.callback(messages[session.lang].delete_all_yes, 'confirm_delete_all_yes'),
-                Markup.button.callback(messages[session.lang].delete_all_no, 'confirm_delete_all_no')
+                Markup.button.callback(m.delete_all_yes, 'confirm_delete_all_yes'),
+                Markup.button.callback(m.delete_all_no, 'confirm_delete_all_no')
             ]
-        ]);
-
-        await ctx.reply(messages[session.lang].confirm_delete_all, confirmKeyboard);
-        await ctx.answerCbQuery();
+        ]));
+        await safeAnswerCbQuery(ctx);
     } catch (error) {
         logger.error('Error in photos_delete_all', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
     }
 });
 
@@ -913,186 +907,109 @@ bot.action('confirm_delete_all_yes', async (ctx) => {
         const session = db.getSession(userId);
 
         if (!session || session.step !== 'photo') {
-            return ctx.answerCbQuery(messages.ru.session_expired);
+            return safeAnswerCbQuery(ctx, messages.ru.session_expired);
         }
 
-        const photoCount = session.photos ? session.photos.length : 0;
+        const m = t(session.lang);
+        const photoCount = session.photos.length;
         session.photos = [];
         db.saveSession(userId, session);
 
-        const keyboard = buildPhotoManagementKeyboard(session.lang, false);
-        const deleteAllMessage = session.lang === 'ru'
-            ? `🗑️ Все фото удалены (${photoCount}). Добавьте хотя бы одно фото для продолжения`
-            : `🗑️ Barcha fotolar o'chirildi (${photoCount}). Davom etish uchun kamida bitta foto qo'shing`;
-
-        await ctx.reply(deleteAllMessage, keyboard);
-        await ctx.answerCbQuery(messages[session.lang].all_photos_deleted);
+        try {
+            await ctx.editMessageText(m.all_deleted_hint(photoCount), buildPhotoManagementKeyboard(session.lang, false));
+        } catch (e) {
+            await ctx.reply(m.all_deleted_hint(photoCount), buildPhotoManagementKeyboard(session.lang, false));
+        }
+        await safeAnswerCbQuery(ctx, m.all_photos_deleted);
 
         logger.info('All photos deleted', { userId, deletedCount: photoCount });
     } catch (error) {
         logger.error('Error confirming delete all', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
     }
 });
 
 bot.action('confirm_delete_all_no', async (ctx) => {
     try {
-        const userId = ctx.from.id;
-        const session = db.getSession(userId);
+        const session = db.getSession(ctx.from.id);
 
         if (!session || session.step !== 'photo') {
-            return ctx.answerCbQuery(messages.ru.session_expired);
+            return safeAnswerCbQuery(ctx, messages.ru.session_expired);
         }
 
-        const count = session.photos ? session.photos.length : 0;
-        const keyboard = buildPhotoManagementKeyboard(session.lang, count > 0);
-
-        const cancelMessage = session.lang === 'ru'
-            ? `❌ Удаление отменено. У вас ${count} фото`
-            : `❌ O'chirish bekor qilindi. Sizda ${count} ta foto bor`;
-
-        await ctx.reply(cancelMessage, keyboard);
-        await ctx.answerCbQuery();
+        const m = t(session.lang);
+        const count = session.photos.length;
+        try {
+            await ctx.editMessageText(m.delete_cancelled(count), buildPhotoManagementKeyboard(session.lang, count > 0));
+        } catch (e) {
+            await ctx.reply(m.delete_cancelled(count), buildPhotoManagementKeyboard(session.lang, count > 0));
+        }
+        await safeAnswerCbQuery(ctx);
     } catch (error) {
         logger.error('Error in confirm_delete_all_no', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
     }
 });
 
 // ========== ORDER CANCELLATION BY USER ==========
-bot.action(/cancel_order:(.+)/, async (ctx) => {
+bot.action(/^cancel_order:(.+)$/, async (ctx) => {
     try {
         const orderId = ctx.match[1];
         const order = db.getOrder(orderId);
 
         if (!order) {
-            return ctx.answerCbQuery('Заказ уже отменён или не найден.');
+            return safeAnswerCbQuery(ctx, 'Заказ уже отменён или выполнен.');
         }
 
         if (String(order.creatorId) !== String(ctx.from.id)) {
-            return ctx.answerCbQuery('Вы не можете отменить этот заказ.');
+            return safeAnswerCbQuery(ctx, 'Вы не можете отменить этот заказ.');
         }
 
-        // Archive as cancelled
-        db.cancelOrder(orderId);
-
-        // Notify admin group
-        const cancelMessage = order.lang === 'ru'
-            ? `❌ Заказ отменён пользователем.\n\n👤 ${sanitizeText(order.name)}\n📞 ${order.phone}`
-            : `❌ Buyurtma foydalanuvchi tomonidan bekor qilindi.\n\n👤 ${sanitizeText(order.name)}\n📞 ${order.phone}`;
-
-        try {
-            await bot.telegram.sendMessage(config.groupChatId, cancelMessage);
-        } catch (error) {
-            logger.error('Failed to send cancellation to group', error, { orderId });
+        const archived = db.cancelOrder(orderId);
+        if (!archived) {
+            return safeAnswerCbQuery(ctx, 'Заказ уже отменён или выполнен.');
         }
 
+        await notifyGroupOrderCancelled(archived);
+
+        const m = t(order.lang);
         try {
-            await ctx.editMessageText(
-                order.lang === 'ru' ? 'Заказ отменён.' : 'Buyurtma bekor qilindi.',
-                Markup.inlineKeyboard([
-                    Markup.button.callback(
-                        order.lang === 'ru' ? '🔄 Начать заново' : '🔄 Qayta boshlash',
-                        'restart'
-                    )
-                ])
-            );
+            await ctx.editMessageText(m.order_cancelled, Markup.inlineKeyboard([
+                Markup.button.callback(m.restart, 'restart')
+            ]));
         } catch (e) {
             // Message already edited
         }
 
-        await ctx.answerCbQuery('Заказ отменён.');
+        await safeAnswerCbQuery(ctx, m.order_cancelled);
         logger.info('Order cancelled by user', { orderId, userId: ctx.from.id });
     } catch (error) {
         logger.error('Error cancelling order', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
+        await safeAnswerCbQuery(ctx, '❌ Ошибка');
     }
 });
 
-// ========== ORDER COMPLETION BY ADMIN ==========
-bot.action(/order_ready:(.+)/, async (ctx) => {
-    try {
-        const orderId = ctx.match[1];
-        const order = db.getOrder(orderId);
-
-        if (!order) {
-            return ctx.answerCbQuery('Заказ уже обработан или не найден.');
-        }
-
-        // Archive as completed
-        db.completeOrder(orderId, 'completed');
-
-        const summaryText = messages[order.lang].summary(order);
-        const newText = `${summaryText}\n\n${order.lang === 'ru' ? 'Заказ готов.' : 'Buyurtma tayyor.'}`;
-
-        try {
-            await ctx.editMessageText(newText);
-        } catch (e) {
-            logger.error('Error editing message', e);
-        }
-
-        await ctx.answerCbQuery(order.lang === 'ru' ? 'Заказ отмечен как готов.' : 'Buyurtma tayyor deb belgilandi.');
-        logger.info('Order marked ready by admin', { orderId, adminId: ctx.from.id });
-    } catch (error) {
-        logger.error('Error marking order ready', error, { userId: ctx.from?.id });
-        await ctx.answerCbQuery('❌ Ошибка');
-    }
-});
-
-// ========== RESTART ACTION ==========
+// ========== RESTART ACTION (button under the order summary) ==========
 bot.action('restart', async (ctx) => {
     try {
         const userId = ctx.from.id;
 
-        // Cancel active order if exists
-        const activeOrder = db.getUserActiveOrder(userId);
-        if (activeOrder) {
-            db.cancelOrder(activeOrder.orderId);
+        // Cancel all active orders of this user (the button is shown under the order summary)
+        const cancelledCount = await cancelUserActiveOrders(userId, 'повторный запуск');
 
-            const cancelMessage = activeOrder.lang === 'ru'
-                ? `❌ Заказ отменён пользователем через повторный запуск.\n\n👤 ${sanitizeText(activeOrder.name)}\n📞 ${activeOrder.phone}`
-                : `❌ Buyurtma foydalanuvchi tomonidan qayta boshlash tufayli bekor qilindi.\n\n👤 ${sanitizeText(activeOrder.name)}\n📞 ${activeOrder.phone}`;
-
-            try {
-                await bot.telegram.sendMessage(config.groupChatId, cancelMessage);
-            } catch (error) {
-                logger.error('Failed to send restart cancellation to group', error);
-            }
-        }
-
-        // Start new session
-        db.saveSession(userId, { step: 'lang' });
-        await ctx.answerCbQuery();
-
+        await safeAnswerCbQuery(ctx);
         try {
             await ctx.deleteMessage();
         } catch (e) {
             // Message can't be deleted
         }
 
-        await ctx.reply(
-            `${messages.ru.welcome}\n${messages.uz.welcome}`,
-            Markup.keyboard([['Русский 🇷🇺', "O'zbek 🇺🇿"]]).oneTime().resize()
-        );
-
-        logger.info('User restarted', { userId });
+        await startNewSession(ctx);
+        logger.info('User restarted', { userId, cancelledCount });
     } catch (error) {
         logger.error('Error in restart action', error, { userId: ctx.from?.id });
     }
 });
-
-// ========== SESSION CLEANUP TASK ==========
-setInterval(() => {
-    try {
-        const deletedSessions = db.cleanExpiredSessions(SESSION_TIMEOUT_MS);
-
-        if (deletedSessions > 0) {
-            logger.info('Cleanup completed', { deletedSessions });
-        }
-    } catch (error) {
-        logger.error('Error in cleanup task', error);
-    }
-}, CLEANUP_INTERVAL_MS);
 
 // ========== ERROR HANDLERS ==========
 bot.catch((error, ctx) => {
@@ -1102,30 +1019,51 @@ bot.catch((error, ctx) => {
     });
 });
 
-// ========== GRACEFUL SHUTDOWN ==========
-process.once('SIGINT', () => {
-    logger.info('SIGINT received, shutting down gracefully');
-    bot.stop('SIGINT');
-    db.close();
-    process.exit(0);
-});
+// ========== CLEANUP TASK ==========
+function startCleanupTask() {
+    return setInterval(() => {
+        try {
+            const deletedSessions = db.cleanExpiredSessions(SESSION_TIMEOUT_MS);
+            const deletedRateLimits = db.cleanOldRateLimits();
 
-process.once('SIGTERM', () => {
-    logger.info('SIGTERM received, shutting down gracefully');
-    bot.stop('SIGTERM');
+            if (deletedSessions > 0 || deletedRateLimits > 0) {
+                logger.info('Cleanup completed', { deletedSessions, deletedRateLimits });
+            }
+        } catch (error) {
+            logger.error('Error in cleanup task', error);
+        }
+    }, CLEANUP_INTERVAL_MS);
+}
+
+// ========== GRACEFUL SHUTDOWN ==========
+function shutdown(signal, cleanupTimer) {
+    logger.info(`${signal} received, shutting down gracefully`);
+    clearInterval(cleanupTimer);
+    for (const entry of pendingAlbums.values()) clearTimeout(entry.timer);
+    bot.stop(signal);
     db.close();
     process.exit(0);
-});
+}
 
 // ========== BOT LAUNCH ==========
-bot.launch()
-    .then(() => {
+function main() {
+    const cleanupTimer = startCleanupTask();
+    process.once('SIGINT', () => shutdown('SIGINT', cleanupTimer));
+    process.once('SIGTERM', () => shutdown('SIGTERM', cleanupTimer));
+
+    bot.launch(() => {
         const stats = db.getStats();
         logger.info('Bot started successfully', stats);
         console.log('🤖 Бот запущен...');
         console.log(`📊 Статистика: ${stats.activeSessions} сессий, ${stats.activeOrders} активных заказов, ${stats.completedOrders} завершённых`);
-    })
-    .catch((error) => {
+    }).catch((error) => {
         logger.error('Failed to start bot', error);
         process.exit(1);
     });
+}
+
+if (require.main === module) {
+    main();
+}
+
+module.exports = { bot, db };
